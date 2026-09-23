@@ -1,0 +1,1027 @@
+<!DOCTYPE html>
+<!--
+  M1S · Ecom Allocation — saulb96.github.io/ecom-allocation/
+  ─────────────────────────────────────────────────────────────────────────────
+  Dashboard over the weekly Shopify allocation export. The only write is the replenishment email (Graph /me/sendMail,
+  sent as the signed-in user, with an .xlsx attached). Nothing is written to SharePoint.
+  Source: every .xlsx / .xls / .csv in FOLDER = /sites/RubyMillieNYCECOM/Shared Documents/Report/Shopify (Ruby & Millie NYC - ECOM site). No lists, no Function — the page reads the files
+  directly each time it opens; Refresh re-reads the folder (files already read are reused unless modified).
+    Newest file (by the date in the file name "export_Aug23_to_Sep21_2026", else created date) = current week.
+    Up to HISTORY_FILES files feed Trends and the per-SKU history in the drawer.
+  Allocation quantity is taken from the export as-is (column "ECOM ALLOCATION QUANTITY - Requested mm/dd/yy").
+  Week date = the "Requested" date in that header → else the file's created date → else the file-name date.
+  Headers matched by name (case/space-insensitive). A missing required column stops that file and names the column.
+  Status (first match):
+    Sells out before restock = allocate > 0 and sells out sooner than lead time
+    Allocate = allocate > 0 · No sales = avg daily sales 0 · Overstock = cover > OVERSTOCK_DAYS · else Covered
+  Cover = (on hand + incoming) ÷ avg daily sales.
+  Pull back = overstock / no-sales SKUs holding more than avg daily sales × (lead time + days to keep).
+  Allocate = the export's quantity rounded UP to full cases (CASE_PACK, or a CASE PACK column if the export ever has one);
+  every view, total and email uses the rounded number (Shopify's figure shows in tooltips, the drawer and the email sheet).
+  Allocate counter = every SKU with allocate > 0 (includes Sells out before restock). Opens on Days of cover.
+  Replenish = the ticked styles (ticks shared by Days of cover and Allocation); urgent first. Latest week only. "Sent" marker is per browser (localStorage).
+  Column order everywhere: SKU → Description → Variant. Cost, can-come-back units and needed-for-target are not shown (per Saul).
+  Sells-out date blank in the export → estimated from cover (shown in italics).
+  Auth: MSAL 2.38 (SPA), delegated scopes https://met1sol.sharepoint.com/AllSites.Read + Microsoft Graph Mail.Send.
+  App registration: 403f3528-434a-4d68-b226-b93f82a33183 — single tenant, SPA platform, redirect = this page's URL exactly (trailing slash).
+  Users need Read on FOLDER. Lock the app with Assignment Required = Yes and assign the ecom team.
+-->
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>M1S · Ecom Allocation</title>
+<link rel="icon" type="image/png" href="favicon.png">
+<script src="https://alcdn.msauth.net/browser/2.38.0/js/msal-browser.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<style>
+  :root{
+    --ink:#16202c; --muted:#5f6c7d;
+    --glass:rgba(255,255,255,.62); --glass2:rgba(255,255,255,.45);
+    --edge:rgba(255,255,255,.75); --shadow:0 8px 32px rgba(31,45,75,.12);
+    --accentink:#1b6fae; --sel:#1b6fae; --design:#f2734a; --grid:rgba(95,108,125,.16);
+    --late:#c2415f; --short:#9a6e0d; --landed:#1d7a55; --nosup:#4b5563; --past:#b4452f;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif; color:var(--ink); overflow-x:hidden;
+    background:linear-gradient(135deg,#e8f0fa 0%,#f3eef9 45%,#eaf6f1 100%)}
+  #bgArt{position:fixed; inset:0; z-index:0; opacity:.55; pointer-events:none}
+  .glass{background:var(--glass); backdrop-filter:blur(18px) saturate(1.4); -webkit-backdrop-filter:blur(18px) saturate(1.4);
+    border:1px solid var(--edge); box-shadow:var(--shadow); border-radius:18px}
+  .hidden{display:none !important}
+  button,select,input,textarea{font-family:inherit}
+
+  /* gate */
+  #gate{position:fixed; inset:0; z-index:60; display:flex; align-items:center; justify-content:center; padding:20px;
+    background:linear-gradient(135deg,#e8f0fa 0%,#f3eef9 45%,#eaf6f1 100%)}
+  .gate-card{max-width:380px; width:100%; padding:42px 40px; text-align:center}
+  .gate-card .logo{font-size:13px; letter-spacing:.35em; font-weight:700; color:var(--accentink); margin-bottom:14px}
+  .gate-card h2{font-size:24px; font-weight:700; letter-spacing:-.4px; margin-bottom:8px}
+  .gate-card p{font-size:13.5px; color:var(--muted); line-height:1.55; margin-bottom:24px}
+  .gate-err{margin-top:14px; font-size:12px; color:#b4452f; min-height:16px}
+  .gate-sub{margin-top:18px; font-size:11px; color:var(--muted)}
+
+  /* buttons + inputs */
+  .btn{font-size:12.5px; font-weight:600; padding:8px 13px; border-radius:11px; border:1px solid var(--edge);
+    background:rgba(255,255,255,.75); cursor:pointer; color:var(--ink); transition:.13s; white-space:nowrap}
+  .btn:hover{background:#fff; box-shadow:0 4px 12px rgba(31,45,75,.1)}
+  .btn:disabled{opacity:.55; cursor:default; box-shadow:none}
+  .btn.primary{color:#fff; background:linear-gradient(135deg,#2f9bd6,#1b6fae); box-shadow:0 6px 20px rgba(31,111,174,.3)}
+  .btn.primary:hover{box-shadow:0 9px 26px rgba(31,111,174,.4)}
+  .btn.sm{padding:6px 10px; font-size:11.5px}
+  .btn.link{background:none; border:none; box-shadow:none; color:var(--muted); text-decoration:underline; font-weight:500; padding:2px 4px}
+  input[type=search],input[type=text],select,textarea{font-size:12.5px; border-radius:11px; border:1px solid var(--edge);
+    background:rgba(255,255,255,.8); padding:7px 10px; color:var(--ink); outline:none; transition:.13s}
+  input:focus,select:focus,textarea:focus{background:#fff; box-shadow:0 0 0 3px rgba(47,155,214,.18)}
+  :focus-visible{outline:2px solid rgba(47,155,214,.6); outline-offset:2px}
+  label.lbl{font-size:9.5px; font-weight:700; text-transform:uppercase; letter-spacing:.12em; color:var(--muted); display:block; margin-bottom:4px}
+  input[type=checkbox]{accent-color:#1b6fae; cursor:pointer}
+
+  /* shell */
+  #app{position:relative; z-index:1; min-height:100vh; padding:22px clamp(14px,3vw,38px)}
+  header.bar{display:flex; align-items:center; gap:16px; padding:14px 22px; margin-bottom:16px; flex-wrap:wrap}
+  .brand{font-size:12px; letter-spacing:.32em; font-weight:700; color:var(--accentink)}
+  .brand b{color:var(--ink)}
+  .asof{font-size:12px; color:var(--muted)}
+  .asof b{color:var(--ink); font-weight:600}
+  .warn{color:var(--past); font-weight:600}
+  .who{margin-left:auto; text-align:right; font-size:12.5px; color:var(--muted); display:flex; align-items:center; gap:12px}
+  .who b{color:var(--ink); font-weight:600}
+  .who select{max-width:220px}
+  .signout{font-size:11.5px; color:var(--muted); text-decoration:underline; cursor:pointer; background:none; border:none}
+
+  /* totals + status counters (counters double as filters) */
+  .counters{display:flex; gap:8px; flex-wrap:wrap; margin-bottom:14px; align-items:stretch}
+  .tot{padding:10px 16px; border-radius:14px; background:rgba(255,255,255,.8); border:1px solid var(--edge); box-shadow:0 4px 14px rgba(31,45,75,.08); min-width:150px}
+  .tot .n{font-size:22px; font-weight:700; letter-spacing:-.5px; line-height:1.1}
+  .tot .l{font-size:11.5px; color:var(--muted); margin-top:2px}
+  .counters .sep{width:1px; background:rgba(95,108,125,.22); margin:4px 6px}
+  .counter{padding:10px 14px; min-width:104px; cursor:pointer; border-radius:14px; transition:.13s; user-select:none;
+    background:rgba(255,255,255,.55); border:1px solid var(--edge)}
+  .counter:hover{background:rgba(255,255,255,.8)}
+  .counter.on{background:rgba(255,255,255,.92); box-shadow:0 4px 14px rgba(31,45,75,.12); border-color:rgba(27,111,174,.35)}
+  .counter .n{font-size:22px; font-weight:700; letter-spacing:-.5px; line-height:1.1}
+  .counter .l{font-size:11.5px; color:var(--muted); margin-top:2px}
+  .counter[data-k=gap] .n{color:var(--late)} .counter[data-k=alloc] .n{color:var(--short)}
+  .counter[data-k=covered] .n{color:var(--landed)} .counter[data-k=over] .n{color:var(--accentink)} .counter[data-k=nosales] .n{color:var(--nosup)}
+
+  .tabs{display:flex; gap:4px; margin-bottom:12px; flex-wrap:wrap}
+  .tab{padding:8px 14px; border-radius:11px; font-size:13px; font-weight:600; cursor:pointer; color:var(--muted); border:1px solid transparent; background:none}
+  .tab:hover{background:var(--glass2); border-color:var(--edge)}
+  .tab.active{background:rgba(255,255,255,.85); color:var(--ink); border-color:var(--edge); box-shadow:0 4px 14px rgba(31,45,75,.10)}
+
+  .panel{padding:16px 18px}
+  .filters{display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end; margin-bottom:12px}
+  .filters .f{display:flex; flex-direction:column}
+  .filters .grow{flex:1; min-width:180px}
+  .filters .spacer{flex:1}
+  .meta{font-size:12px; color:var(--muted); margin-bottom:8px; display:flex; gap:14px; align-items:center; flex-wrap:wrap}
+
+  /* table */
+  .tw{overflow:auto; max-height:calc(100vh - 360px); border:1px solid var(--edge); border-radius:13px; background:rgba(255,255,255,.55)}
+  table{border-collapse:separate; border-spacing:0; width:100%; font-size:12.5px}
+  th{position:sticky; top:0; z-index:2; background:rgba(240,245,251,.97); text-align:left; font-weight:600; padding:8px 9px;
+    border-bottom:1px solid var(--grid); white-space:nowrap; cursor:pointer; user-select:none}
+  th.r{text-align:right}
+  th .arrow{color:var(--accentink); font-size:10px; margin-left:3px}
+  td{padding:6px 9px; border-bottom:1px solid var(--grid); white-space:nowrap; vertical-align:middle}
+  td.wrap{white-space:normal; min-width:200px}
+  th.fit,td.fit{width:1%; white-space:nowrap}
+  .vr{color:var(--muted)}
+  /* days-of-cover grid: tick | SKU | description | variant | runway */
+  .cv{display:grid; grid-template-columns:34px auto auto auto minmax(340px,1fr); font-size:12.5px; min-width:760px}
+  .cv .cr{display:contents}
+  .cv .ch{position:sticky; top:0; z-index:3; background:rgba(240,245,251,.97); font-weight:600; height:48px; display:flex; align-items:flex-end; padding:0 8px 7px; border-bottom:1px solid var(--grid); white-space:nowrap}
+  .cv .cc{height:26px; display:flex; align-items:center; padding:0 8px; white-space:nowrap; border-bottom:1px solid var(--grid); cursor:pointer}
+  .cv .cbx{justify-content:center; padding:0; cursor:default}
+  .cv .sku{font-variant-numeric:tabular-nums}
+  .cv .ds{max-width:250px; overflow:hidden; text-overflow:ellipsis; display:block; line-height:26px}
+  .cv .cr:hover > .cc{background:rgba(255,255,255,.78)}
+  .cv .cr.cur > .cc{background:rgba(47,155,214,.10)}
+  .cv .cr.s-gap > .cc:first-child{box-shadow:inset 3px 0 0 var(--late)}
+  .cv .track{position:relative; padding:0; border-bottom:none}
+  .cv .ti{position:absolute; top:0; bottom:0; left:10px; right:130px;
+    background-image:linear-gradient(to right,rgba(95,108,125,.14) 1px,transparent 1px); background-size:var(--mo) 100%}
+  .cv .ch.axis{padding:0; position:sticky}
+  .cv .ch.axis .ti{background:none}
+  .cv .tk{position:absolute; top:6px; transform:translateX(-50%); font-size:10.5px; font-weight:500; color:var(--muted)}
+  .cv .mkl{position:absolute; top:24px; font-size:10.5px; font-weight:700; white-space:nowrap}
+  .cv .mkl.rs{color:var(--late); transform:translateX(calc(-100% - 5px))} .cv .mkl.tg{color:var(--accentink); transform:translateX(5px)}
+  .cv .mk{position:absolute; top:0; bottom:0; width:0}
+  .cv .ch .mk{top:24px}
+  .cv .mk.rs{border-left:1.5px dashed var(--late)} .cv .mk.tg{border-left:1.5px solid var(--accentink)}
+  .cv .bar,.cv .gh,.cv .hat{position:absolute; top:7px; height:12px}
+  .cv .bar{border-radius:6px; background:var(--c); min-width:4px}
+  .cv .gh{border-radius:6px; background:var(--cg); border:1px dashed var(--c); box-sizing:border-box}
+  .cv .hat{background:repeating-linear-gradient(45deg,rgba(194,65,95,.5) 0 3px,transparent 3px 6px)}
+  .cv .arw{position:absolute; top:7px; left:100%; margin-left:2px; border-top:6px solid transparent; border-bottom:6px solid transparent; border-left:8px solid var(--c)}
+  .cv .cvl{position:absolute; top:6px; font-size:10.5px; color:var(--muted); white-space:nowrap; font-variant-numeric:tabular-nums}
+  .s-gap{--c:#c2415f; --cg:rgba(194,65,95,.16)} .s-alloc{--c:#e0a92e; --cg:rgba(224,169,46,.2)} .s-covered{--c:#36a37a; --cg:rgba(54,163,122,.18)}
+  .s-over{--c:#2f9bd6; --cg:rgba(47,155,214,.18)} .s-nosales{--c:#8b95a3; --cg:rgba(139,149,163,.18)}
+  th.cb,td.cb{width:34px; text-align:center; cursor:default}
+  tr.row{cursor:pointer}
+  tr.row:hover td{background:rgba(255,255,255,.78)}
+  tr.row.cur td{background:rgba(47,155,214,.10)}
+  tr.row.st-gap td:first-child{box-shadow:inset 3px 0 0 var(--late)}
+  tr.row.st-alloc td:first-child{box-shadow:inset 3px 0 0 #e0a92e}
+  td.num{text-align:right; font-variant-numeric:tabular-nums}
+  td.strong{font-weight:700}
+  .dim{color:var(--muted)}
+  .est{color:var(--muted); font-style:italic}
+  .pill{display:inline-block; font-size:10px; font-weight:700; letter-spacing:.04em; padding:2px 7px; border-radius:7px; white-space:nowrap}
+  .pill.gap{background:rgba(194,65,95,.14); color:var(--late)}
+  .pill.alloc{background:rgba(224,169,46,.18); color:var(--short)}
+  .pill.covered{background:rgba(54,163,122,.15); color:var(--landed)}
+  .pill.over{background:rgba(47,155,214,.12); color:var(--accentink)}
+  .pill.nosales{background:rgba(75,85,99,.12); color:var(--nosup)}
+  .empty{padding:40px; text-align:center; color:var(--muted); font-size:13.5px; line-height:1.55}
+  .ct{display:inline-block; font-size:10px; font-weight:700; padding:2px 7px; border-radius:7px; background:rgba(47,155,214,.12); color:var(--accentink)}
+  .ct.bad{background:rgba(194,65,95,.14); color:var(--late)}
+  .runhdr{font-size:13.5px; font-weight:700; margin:16px 0 6px; display:flex; align-items:center; gap:10px; flex-wrap:wrap}
+  .runhdr:first-child{margin-top:0}
+  .runhdr span.h{font-size:12px; color:var(--muted); font-weight:500}
+
+  /* days-of-cover runway */
+  .legend{display:flex; gap:18px; flex-wrap:wrap; font-size:12px; color:var(--muted); margin-bottom:10px}
+  .legend span{display:flex; align-items:center; gap:6px}
+  .sw{display:inline-block; width:26px; height:10px; border-radius:5px}
+  .sw.solid{background:#e0a92e}
+  .sw.ghost{background:rgba(224,169,46,.2); border:1px dashed rgba(224,169,46,.8)}
+  .sw.hatch{border-radius:2px; background:repeating-linear-gradient(45deg,rgba(194,65,95,.5) 0 3px,transparent 3px 6px)}
+  .chartwrap{overflow:auto; scrollbar-gutter:stable; max-height:calc(100vh - 360px); border:1px solid var(--edge); border-radius:13px; background:rgba(255,255,255,.55)}
+  .chartwrap svg{display:block}
+  svg .gl{stroke:rgba(95,108,125,.14); stroke-width:1}
+  svg .tk{font-size:10.5px; fill:var(--muted)}
+  svg .mk{stroke-width:1.5}
+  svg .mk.rs{stroke:var(--late); stroke-dasharray:4 3}
+  svg .mk.tg{stroke:var(--accentink)}
+  svg .mkl{font-size:10.5px; font-weight:700}
+  svg .mkl.rs{fill:var(--late)} svg .mkl.tg{fill:var(--accentink)}
+  svg .lb{font-size:11.5px; fill:var(--ink)}
+  svg .sk{font-size:11.5px; fill:var(--muted); font-weight:600; font-variant-numeric:tabular-nums}
+  svg .vl{font-size:10.5px; fill:var(--muted); font-variant-numeric:tabular-nums}
+  svg .hit{fill:transparent}
+  svg g.bar{cursor:pointer; outline:none}
+  svg g.bar:hover .hit, svg g.bar:focus .hit{fill:rgba(255,255,255,.75)}
+  svg .bv{font-size:10.5px; fill:var(--ink); font-weight:600}
+  svg .bw{font-size:10.5px; fill:var(--muted)}
+
+  /* inline loader: products dropping into a carton */
+  .loader{display:flex; flex-direction:column; align-items:center; gap:8px; padding:34px 10px; color:var(--muted); font-size:13px}
+  .loader svg{width:150px; height:96px}
+  .loader .it{animation:drop 1.9s cubic-bezier(.55,0,.85,.35) infinite; opacity:0}
+  .loader .i2{animation-delay:.63s} .loader .i3{animation-delay:1.26s}
+  @keyframes drop{0%{transform:translateY(-28px);opacity:0}14%{opacity:1}62%{transform:translateY(36px);opacity:1}72%,100%{transform:translateY(44px);opacity:0}}
+
+  /* drawer */
+  .dr{position:fixed; top:0; right:0; bottom:0; width:min(470px,96vw); z-index:50; transform:translateX(105%); transition:transform .18s ease;
+    padding:22px 22px 26px; overflow:auto; border-radius:18px 0 0 18px; display:flex; flex-direction:column; gap:14px}
+  .dr.open{transform:none}
+  #reqDrawer{width:min(640px,96vw)}
+  .dr h3{font-size:18px; font-weight:700; letter-spacing:-.3px; display:flex; align-items:flex-start; gap:8px; line-height:1.25}
+  .dr .close{margin-left:auto; flex:none; width:30px; height:30px; border-radius:50%; border:1px solid var(--edge); background:rgba(255,255,255,.9); cursor:pointer; font-size:13px}
+  .dsub{font-size:12.5px; color:var(--muted); display:flex; gap:8px; align-items:center; flex-wrap:wrap}
+  .kv{display:grid; grid-template-columns:150px 1fr; gap:5px 10px; font-size:12.5px}
+  .kv .k{color:var(--muted)}
+  .kv .v{font-weight:500; font-variant-numeric:tabular-nums}
+  .sect{font-size:9.5px; font-weight:700; text-transform:uppercase; letter-spacing:.12em; color:var(--muted); margin-bottom:6px}
+  #dHist table{font-size:12px}
+  #dHist th{cursor:default}
+
+  .actrow{display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:14px}
+  .actrow .counters{margin-bottom:0}
+  #reqBtn{margin-left:auto}
+  #rTbl tr.st-gap td:first-child{box-shadow:inset 3px 0 0 var(--late)}
+  .rbar{display:flex; align-items:center; gap:12px; flex-wrap:wrap}
+  .rbar .state{flex:1; font-size:12.5px; color:var(--muted); min-width:200px}
+  .toast{position:fixed; bottom:18px; left:50%; transform:translateX(-50%); z-index:80; padding:10px 16px; font-size:12.5px; border-radius:12px;
+    background:rgba(22,32,44,.88); color:#fff; box-shadow:0 8px 24px rgba(0,0,0,.25); opacity:0; transition:opacity .15s; pointer-events:none}
+  .toast.show{opacity:1}
+  @media(prefers-reduced-motion:reduce){ *{transition:none !important} .loader .it{animation:none; opacity:1} }
+  @media(max-width:760px){ .who{margin-left:0; width:100%; justify-content:flex-start; flex-wrap:wrap} .tw,.chartwrap{max-height:none} .counters .sep{display:none} .kv{grid-template-columns:120px 1fr} }
+</style>
+</head>
+<body>
+<canvas id="bgArt"></canvas>
+
+<div id="gate">
+  <div class="gate-card glass">
+    <div class="logo">M1S</div>
+    <h2>Ecom Allocation</h2>
+    <p>What the web store needs this week, what sells out before restock, and what can come back to wholesale. Sign in with your Metro1 Microsoft account.</p>
+    <button class="btn primary" id="loginBtn">Sign in with Microsoft</button>
+    <div class="gate-err" id="gateErr"></div>
+    <div class="gate-sub">Internal use only</div>
+  </div>
+</div>
+
+<div id="app" class="hidden">
+  <header class="bar glass">
+    <div class="brand">M1S <b>· ECOM ALLOCATION</b></div>
+    <div class="asof" id="asof">Loading…</div>
+    <div class="who">
+      <select id="weekSel" title="Show an earlier week's export" aria-label="Week"></select>
+      <button class="btn sm" id="refreshBtn" title="Re-read the export folder">Refresh</button>
+      <span><b id="whoName">—</b></span>
+      <button class="signout" id="signOut">Sign out</button>
+    </div>
+  </header>
+
+  <div class="actrow"><div class="counters" id="counters"></div><button class="btn primary hidden" id="reqBtn" disabled>Replenish</button></div>
+
+  <div class="tabs" role="tablist">
+    <button class="tab active" data-tab="cover">Days of cover</button>
+    <button class="tab" data-tab="alloc">Allocation</button>
+    <button class="tab" data-tab="pull">Pull back</button>
+    <button class="tab" data-tab="trends">Trends</button>
+    <button class="tab" data-tab="issues">Data issues <span id="issueBadge" class="ct bad hidden"></span></button>
+  </div>
+
+  <section class="panel glass" id="loadPanel"></section>
+  <section class="panel glass hidden" id="notice"></section>
+
+  <section class="panel glass hidden" id="mainPanel">
+    <div class="filters" id="filterBar">
+      <div class="f grow"><label class="lbl" for="q">Search</label><input type="search" id="q" placeholder="SKU, description, variant…"></div>
+      <div class="f"><label class="lbl" for="fFam">Description</label><select id="fFam"><option value="">All</option></select></div>
+      <div class="f" id="fVendWrap"><label class="lbl" for="fVend">Vendor</label><select id="fVend"><option value="">All</option></select></div>
+      <div class="spacer"></div>
+      <button class="btn sm" id="clearF">Clear filters</button>
+      <button class="btn sm" id="xlsxBtn" disabled title="Tick rows to export">Export Excel</button>
+    </div>
+
+    <div id="allocView" class="hidden">
+      <div class="meta"><span id="allocCount"></span></div>
+      <div class="tw"><table id="allocTbl"><thead></thead><tbody></tbody></table></div>
+    </div>
+
+    <div id="coverView">
+      <div class="legend">
+        <span><i class="sw solid"></i>Stock today</span>
+        <span><i class="sw ghost"></i>After this week's allocation</span>
+        <span><i class="sw hatch"></i>Days with nothing to sell</span>
+      </div>
+      <div class="chartwrap" id="coverChart"></div>
+    </div>
+
+    <div id="pullView" class="hidden">
+      <div class="meta"><span id="pullCount"></span><span>Overstock and no-sales SKUs holding more than lead time + days to keep.</span></div>
+      <div class="tw"><table id="pullTbl"><thead></thead><tbody></tbody></table></div>
+    </div>
+
+    <div id="trendsView" class="hidden"><div id="trendsBody"></div></div>
+    <div id="issuesView" class="hidden"><div id="issuesBody"></div></div>
+  </section>
+</div>
+
+<aside id="drawer" class="glass dr" aria-hidden="true">
+  <h3><span id="dTitle">—</span><button class="close" id="dClose" title="Close">&#10005;</button></h3>
+  <div class="dsub" id="dSub"></div>
+  <div><div class="sect">This week</div><div class="kv" id="dWeek"></div></div>
+  <div><div class="sect">Stock and sales</div><div class="kv" id="dStock"></div></div>
+  <div><div class="sect">Week by week</div><div id="dHist"></div></div>
+</aside>
+
+<aside id="reqDrawer" class="glass dr" aria-hidden="true">
+  <h3><span>Replenishment request</span><button class="close" id="rClose" title="Close">&#10005;</button></h3>
+  <div class="dsub" id="rSub"></div>
+  <div><label class="lbl" for="rTo">To</label><input type="text" id="rTo" style="width:100%" placeholder="name@metro1solutions.com; name2@…"></div>
+  <div><label class="lbl" for="rNote">Note (optional)</label><textarea id="rNote" rows="2" style="width:100%;resize:vertical" placeholder="Anything the warehouse should know"></textarea></div>
+  <div class="tw" style="max-height:none"><table id="rTbl"><thead></thead><tbody></tbody></table></div>
+  <div class="meta" id="rFoot"></div>
+  <div class="rbar"><span class="state" id="rState"></span><button class="btn primary" id="rSend">Send request</button></div>
+</aside>
+
+<div class="toast" id="toast"></div>
+
+<script>
+/* ───────────────────── config ───────────────────── */
+const FOLDER    = "/sites/RubyMillieNYCECOM/Shared Documents/Report/Shopify";   // server-relative folder the weekly export lands in
+const CLIENT_ID = "403f3528-434a-4d68-b226-b93f82a33183";            // this tool's SPA app registration
+const TENANT    = "eeea7e3e-9ccb-4a16-894e-3417c6a7a4c1";
+const SITE = "https://met1sol.sharepoint.com" + ((FOLDER.match(/^\/sites\/[^/]+/)||[""])[0]);
+const MSAL_CONFIG = {
+  auth:{ clientId:CLIENT_ID, authority:"https://login.microsoftonline.com/"+TENANT, redirectUri:window.location.origin + window.location.pathname },
+  cache:{ cacheLocation:"localStorage" }
+};
+const SP_SCOPES = ["https://met1sol.sharepoint.com/AllSites.Read"];
+const MAIL_SCOPES = ["https://graph.microsoft.com/Mail.Send"];
+const CASE_PACK = 48;         // units per case for the replenishment request (rounded UP)
+const REQUEST_TO = "";        // default recipient(s) for the request, ";"-separated — editable before sending
+const OVERSTOCK_DAYS = 365;   // cover above this = Overstock
+const STALE_DAYS = 8;         // warn when the newest export is older than this
+const HISTORY_FILES = 26;     // weeks read for Trends / per-SKU history
+const DEF_LEAD = 10, DEF_TARGET = 120;   // used only when the export leaves lead time / days to keep blank
+
+/* ───────────────────── background (seeded flow field) ───────────────────── */
+(function(){
+  const c=document.getElementById('bgArt'), x=c.getContext('2d');
+  let W,H; function fit(){W=c.width=innerWidth;H=c.height=innerHeight;} fit(); addEventListener('resize',fit);
+  let seed=20260610; function rnd(){seed=(seed*1664525+1013904223)>>>0; return seed/4294967296;}
+  const hues=[[47,155,214],[148,102,214],[54,163,122],[242,115,74]];
+  const pts=[]; for(let i=0;i<70;i++){const h=hues[Math.floor(rnd()*hues.length)];
+    pts.push({x:rnd()*innerWidth,y:rnd()*innerHeight,a:rnd()*Math.PI*2,s:.25+rnd()*.4,c:h,r:.6+rnd()*1.4});}
+  function field(px,py,t){return Math.sin(px*.0016+t*.00012)*1.7+Math.cos(py*.0019-t*.00009)*1.7;}
+  const still=matchMedia('(prefers-reduced-motion: reduce)').matches;
+  let t=0;
+  function tick(){
+    t++;
+    x.fillStyle='rgba(245,247,250,0.045)'; x.fillRect(0,0,W,H);
+    pts.forEach(p=>{
+      const a=field(p.x,p.y,t);
+      p.x+=Math.cos(a)*p.s; p.y+=Math.sin(a)*p.s;
+      if(p.x<-10)p.x=W+10; if(p.x>W+10)p.x=-10; if(p.y<-10)p.y=H+10; if(p.y>H+10)p.y=-10;
+      x.beginPath(); x.arc(p.x,p.y,p.r,0,7);
+      x.fillStyle='rgba('+p.c[0]+','+p.c[1]+','+p.c[2]+',0.18)'; x.fill();
+    });
+    if(!still) requestAnimationFrame(tick);
+  }
+  tick();
+})();
+
+/* ── parse:start ── (pure: file → rows; no DOM) */
+const DAY = 864e5;
+const N = s => String(s==null?'':s).toUpperCase().replace(/\s+/g,' ').trim();
+const clean = v => String(v==null?'':v).trim();
+const num = v => { if(v===''||v==null) return null; if(typeof v==='number') return isFinite(v)?v:null;
+  const n=parseFloat(String(v).replace(/[$,\s]/g,'')); return isNaN(n)?null:n; };
+const MON = {JAN:0,FEB:1,MAR:2,APR:3,MAY:4,JUN:5,JUL:6,AUG:7,SEP:8,OCT:9,NOV:10,DEC:11};
+const cap3 = s => s.charAt(0).toUpperCase()+s.slice(1,3).toLowerCase();
+
+// every date is a UTC-midnight timestamp and is always formatted in UTC, so nothing shifts a day
+function parseDate(v){
+  if(v===''||v==null) return null;
+  if(typeof v==='number') return v>20000&&v<80000 ? (Math.floor(v)-25569)*DAY : null;
+  if(v instanceof Date) return isNaN(v) ? null : Date.UTC(v.getFullYear(),v.getMonth(),v.getDate());
+  const s=String(v).trim(); let m;
+  if((m=s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/))) return Date.UTC(+m[1],m[2]-1,+m[3]);
+  if((m=s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2}|\d{4})$/))) return Date.UTC(m[3].length===2?2000+(+m[3]):+m[3],m[1]-1,+m[2]);
+  return null;
+}
+function nyDay(d){ return parseDate(new Date(d).toLocaleDateString('en-CA',{timeZone:'America/New_York'})); }
+function nameDate(name){ // "export_Aug23_to_Sep21_2026" → Sep 21 2026
+  const m=String(name||'').match(/to_([A-Za-z]{3})[A-Za-z]*_?(\d{1,2})_(\d{4})/); if(!m) return null;
+  const mo=MON[m[1].toUpperCase()]; return mo==null ? null : Date.UTC(+m[3],mo,+m[2]);
+}
+function prettyName(name){
+  const m=String(name||'').match(/([A-Za-z]{3})[A-Za-z]*_?(\d{1,2})_to_([A-Za-z]{3})[A-Za-z]*_?(\d{1,2})_(\d{4})/);
+  return m ? `${cap3(m[1])} ${+m[2]} – ${cap3(m[3])} ${+m[4]}, ${m[5]}` : String(name||'').replace(/\.[^.]+$/,'');
+}
+function fileKey(f){ return nameDate(f.Name) ?? (f.TimeCreated ? nyDay(f.TimeCreated) : 0); }
+function parseDeadline(v, base){
+  const s=clean(v); if(!s) return null;
+  if(/^today$/i.test(s)||/overdue|passed|past/i.test(s)) return base;
+  const m=s.match(/^(\d+)\s*days?$/i); if(m) return base+(+m[1])*DAY;
+  return parseDate(v);
+}
+
+const COLS = {
+  product:{names:['PRODUCT','PRODUCT TITLE','TITLE'], req:1},
+  variant:{names:['VARIANT','VARIANT TITLE']},
+  sku:{names:['SKU'], req:1},
+  vendor:{names:['VENDOR']},
+  alloc:{prefix:'ECOM ALLOCATION QUANTITY', req:1},
+  onhand:{names:['INVENTORY INHAND','INVENTORY IN HAND','IN HAND','ON HAND'], req:1},
+  incoming:{names:['INCOMING INVENTORY','INCOMING']},
+  ads:{names:['AVERAGE DAILY SALES','AVG DAILY SALES'], req:1},
+  sold:{names:['UNITS SOLD']},
+  soDays:{names:['SELLS OUT IN DAYS']},
+  soDate:{names:['SELLS OUT ON DATE']},
+  revenue:{names:['REVENUE']},
+  deadline:{names:['REORDER DEADLINE']},
+  cost:{names:['REORDER QUANTITY COST']},
+  arrives:{names:['STOCK ARRIVES ON']},
+  lead:{names:['YOUR LEAD TIME','LEAD TIME']},
+  lasts:{names:['STOCK LASTS TILL']},
+  target:{names:['DAYS OF STOCK YOU WANT TO KEEP']},
+  casePack:{names:['CASE PACK','CASEPACK','CASE QTY','CASE PACK QTY','UNITS PER CASE'], quiet:1}
+};
+
+function parseWorkbook(buf, file){
+  if(typeof XLSX==='undefined') throw new Error('Excel reader did not load — check the network and refresh');
+  const wb=XLSX.read(buf,{type:'array'});
+  const ws=wb.Sheets[wb.SheetNames[0]];
+  const aoa=XLSX.utils.sheet_to_json(ws,{header:1,raw:true,defval:''});
+  let h=-1; for(let i=0;i<Math.min(aoa.length,15);i++){ if(aoa[i].some(c=>N(c)==='SKU')){ h=i; break; } }
+  if(h<0) throw new Error('No header row with a SKU column in the first 15 rows');
+  const hdr=aoa[h].map(N), idx={}, missing=[], warns=[];
+  for(const [k,c] of Object.entries(COLS)){
+    const i = c.prefix ? hdr.findIndex(x=>x.startsWith(c.prefix)) : hdr.findIndex(x=>c.names.includes(x));
+    if(i<0&&!c.quiet) (c.req?missing:warns).push(c.prefix||c.names[0]);
+    idx[k]=i;
+  }
+  if(missing.length) throw new Error('Missing column: '+missing.join(' / '));
+  const m=String(aoa[h][idx.alloc]).match(/(\d{1,2})\/(\d{1,2})\/(\d{2}|\d{4})/);
+  const asOf=(m?parseDate(m[0]):null) ?? (file&&file.TimeCreated?nyDay(file.TimeCreated):null) ?? nameDate(file&&file.Name) ?? nyDay(Date.now());
+  const get=(r,k)=>idx[k]>=0?r[idx[k]]:'';
+  const rows=[];
+  for(let i=h+1;i<aoa.length;i++){
+    const r=aoa[i], product=clean(get(r,'product')), sku=clean(get(r,'sku'));
+    if(!product&&!sku) continue;
+    const variant=clean(get(r,'variant'));
+    rows.push(derive({
+      line:i+1, product, sku, variant:/^default title$/i.test(variant)?'':variant, vendor:clean(get(r,'vendor')),
+      alloc:num(get(r,'alloc'))||0, onhand:num(get(r,'onhand'))||0, incoming:num(get(r,'incoming'))||0, ads:num(get(r,'ads'))||0,
+      sold:num(get(r,'sold')), soDays:num(get(r,'soDays')), soDate:parseDate(get(r,'soDate')), revenue:num(get(r,'revenue')),
+      deadline:parseDeadline(get(r,'deadline'),asOf), cost:num(get(r,'cost')), arrives:parseDate(get(r,'arrives')),
+      lead:num(get(r,'lead'))??DEF_LEAD, lasts:parseDate(get(r,'lasts')), target:num(get(r,'target'))??DEF_TARGET, casePack:num(get(r,'casePack'))
+    }, asOf));
+  }
+  return {file, asOf, rows, warns, allocHeader:String(aoa[h][idx.alloc])};
+}
+
+const RANK={gap:0,alloc:1,covered:2,over:3,nosales:4};
+function derive(o, asOf){
+  const stock=o.onhand+o.incoming;
+  o.cover = o.ads>0 ? stock/o.ads : null;
+  if(o.soDate==null && o.cover!=null){ o.soDate=asOf+Math.round(o.cover)*DAY; o.soEst=true; }
+  o.soIn = o.soDate!=null ? Math.round((o.soDate-asOf)/DAY) : (o.soDays!=null ? o.soDays : o.cover);
+  o.need = Math.round(o.ads*(o.lead+o.target));
+  o.excess = o.ads>0 ? Math.max(0, Math.round(stock-o.need)) : Math.max(0, stock);
+  o.shopAlloc = o.alloc;                                   // the export's number
+  o.cp = o.casePack>0 ? o.casePack : CASE_PACK;
+  o.cases = o.alloc>0 ? Math.ceil(o.alloc/o.cp) : 0;
+  o.alloc = o.cases*o.cp;                                  // what we allocate: full cases
+  o.unitCost = o.cost!=null && o.shopAlloc>0 ? o.cost/o.shopAlloc : null;
+  o.status = o.alloc>0 ? (o.soIn!=null && o.soIn<o.lead ? 'gap' : 'alloc')
+           : o.ads<=0 ? 'nosales' : o.cover>OVERSTOCK_DAYS ? 'over' : 'covered';
+  o.key = N(o.sku) || ('ROW'+o.line);
+  o.hay = (o.product+' '+o.variant+' '+o.sku+' '+o.vendor).toLowerCase();
+  return o;
+}
+const pullable = r => (r.status==='over'||r.status==='nosales') && r.excess>0;
+
+function summarize(p){
+  const r=p.rows, a=r.filter(x=>x.alloc>0), pb=r.filter(pullable), sum=(xs,f)=>xs.reduce((s,x)=>s+(f(x)||0),0);
+  const counts={}; Object.keys(RANK).forEach(k=>counts[k]=r.filter(x=>x.status===k).length);
+  return { skus:r.length, units:sum(a,x=>x.alloc), allocN:a.length, cost:sum(a,x=>x.cost), noCost:a.filter(x=>x.cost==null).length,
+    pull:sum(pb,x=>x.excess), pullN:pb.length, sold:sum(r,x=>x.sold), revenue:sum(r,x=>x.revenue), counts };
+}
+
+function groupBy(xs, f){ const m=new Map(); xs.forEach(x=>{ const k=f(x); if(!m.has(k)) m.set(k,[]); m.get(k).push(x); }); return m; }
+function findIssues(p){
+  const cats=[], add=(cat,hint,items)=>{ if(items.length) cats.push({cat,hint,items}); }, rows=p.rows;
+  add('Optional columns not found','Views show blanks where these are missing.', p.warns.map(w=>({text:w})));
+  add('Same SKU on more than one row','Each SKU should appear once — check the export.',
+    [...groupBy(rows.filter(r=>r.sku),r=>N(r.sku)).values()].filter(g=>g.length>1).map(g=>({rows:g, text:`Appears ${g.length} times`})));
+  add('Possible duplicate products','Same product and variant name under different SKUs — confirm they are different items.',
+    [...groupBy(rows,r=>N(r.product).replace(/[^A-Z0-9]/g,'')+'|'+N(r.variant).replace(/[^A-Z0-9]/g,'')).values()]
+      .filter(g=>new Set(g.map(r=>N(r.sku))).size>1).map(g=>({rows:g, text:''})));
+  add('No SKU','', rows.filter(r=>!r.sku).map(r=>({rows:[r], text:'Row '+r.line})));
+  add('Allocation without a restock date','', rows.filter(r=>r.alloc>0&&r.arrives==null).map(r=>({rows:[r], text:''})));
+  add('Negative quantities','', rows.filter(r=>r.shopAlloc<0||r.onhand<0||r.incoming<0).map(r=>({rows:[r], text:`On hand ${r.onhand}, incoming ${r.incoming}, allocate ${r.shopAlloc}`})));
+  return cats;
+}
+
+const fmtN = v => v==null||v==='' ? '' : Math.round(v).toLocaleString('en-US');
+const fmt2 = v => v==null ? '' : (+v).toFixed(2);
+const fmt$ = v => v==null ? '' : '$'+Math.round(v).toLocaleString('en-US');
+const fmtD = v => v==null ? '' : new Date(v).toLocaleDateString('en-US',{timeZone:'UTC',month:'numeric',day:'numeric',year:'2-digit'});
+const fmtCover = v => v==null ? '—' : v>=365 ? (v/365).toFixed(1)+' yrs' : Math.round(v)+' d';
+/* ── parse:end ── */
+
+/* ───────────────────── auth ───────────────────── */
+let msalApp=null, account=null;
+const $=id=>document.getElementById(id);
+
+async function initAuth(){
+  $('loginBtn').onclick=doLogin;
+  if(typeof msal==='undefined'){ $('gateErr').textContent='The sign-in library did not load — check the network and refresh.'; return; }
+  msalApp=new msal.PublicClientApplication(MSAL_CONFIG);
+  await msalApp.initialize();
+  try{ const res=await msalApp.handleRedirectPromise(); if(res&&res.account){ enter(res.account); return; } }catch(e){}
+  const accts=msalApp.getAllAccounts();
+  if(accts.length) enter(accts[0]);
+}
+async function doLogin(){
+  $('gateErr').textContent='';
+  try{
+    if(window.self!==window.top){ const res=await msalApp.loginPopup({scopes:SP_SCOPES}); if(res&&res.account) enter(res.account); }
+    else msalApp.loginRedirect({scopes:SP_SCOPES});
+  }catch(e){ $('gateErr').textContent='Sign-in failed: '+(e.errorMessage||e.message||e); }
+}
+async function token(force){
+  try{ const r=await msalApp.acquireTokenSilent({scopes:SP_SCOPES, account, forceRefresh:!!force}); return r.accessToken; }
+  catch(e){ if(window.self!==window.top){ const r=await msalApp.acquireTokenPopup({scopes:SP_SCOPES, account}); return r.accessToken; }
+            msalApp.acquireTokenRedirect({scopes:SP_SCOPES, account}); throw e; }
+}
+function enter(acct){
+  account=acct; msalApp.setActiveAccount(acct);
+  $('whoName').textContent=(acct.idTokenClaims&&acct.idTokenClaims.name)||acct.username;
+  $('gate').classList.add('hidden'); $('app').classList.remove('hidden');
+  $('signOut').onclick=()=>msalApp.logoutRedirect();
+  loadAll();
+}
+
+/* ───────────────────── SharePoint REST (read-only) ───────────────────── */
+const pathArg = p => "@u='"+encodeURIComponent(p.replace(/'/g,"''"))+"'";
+async function spFetch(url, retry){
+  const tok=await token(!!retry);
+  const r=await fetch(url,{headers:{'Authorization':'Bearer '+tok,'Accept':'application/json;odata=nometadata'}});
+  if(r.status===401 && !retry) return spFetch(url, true);
+  if(!r.ok){ let msg=''; try{ const j=await r.json(); msg=(j['odata.error']&&j['odata.error'].message&&j['odata.error'].message.value)||(j.error&&j.error.message&&(j.error.message.value||j.error.message))||''; }catch(e){}
+    throw new Error(r.status+(msg?' '+msg:'')); }
+  return r;
+}
+async function listFiles(){
+  const r=await spFetch(`${SITE}/_api/web/GetFolderByServerRelativePath(decodedurl=@u)/Files?${pathArg(FOLDER)}&$select=Name,ServerRelativeUrl,TimeCreated,TimeLastModified`);
+  const j=await r.json();
+  return (j.value||[]).filter(f=>/\.(xlsx|xls|csv)$/i.test(f.Name))
+    .sort((a,b)=>(fileKey(b)-fileKey(a)) || (new Date(b.TimeCreated)-new Date(a.TimeCreated)));
+}
+async function readFile(serverRelUrl){
+  const r=await spFetch(`${SITE}/_api/web/GetFileByServerRelativePath(decodedurl=@u)/$value?${pathArg(serverRelUrl)}`);
+  return r.arrayBuffer();
+}
+
+/* ───────────────────── data ───────────────────── */
+let files=[], cur=null, curSum=null, curIssues=[], hist=null, histBad=[], gen=0, drawerKey=null;
+const cache=new Map();
+const state={tab:'cover', chips:new Set(), q:'', fam:'', vend:'', sort:{}};
+const sel={alloc:new Set(), pull:new Set()};
+
+function getParsed(f){
+  const key=f.ServerRelativeUrl+'|'+f.TimeLastModified;
+  if(!cache.has(key)) cache.set(key, readFile(f.ServerRelativeUrl).then(buf=>parseWorkbook(buf,f))
+    .catch(e=>({file:f, error:e.message, rows:[], warns:[], asOf:fileKey(f)})));
+  return cache.get(key);
+}
+async function loadAll(pick){
+  const g=++gen; hist=null; histBad=[];
+  setLoading("Reading this week's export…");
+  $('asof').textContent='Reading the folder…';
+  try{
+    files=await listFiles();
+    if(g!==gen) return;
+    fillWeeks();
+    if(!files.length){ cur=null; $('asof').textContent='No exports yet';
+      showNotice(`No exports in <b>${esc(FOLDER)}</b> yet. The dashboard fills in as soon as the weekly file lands there.`); return; }
+    await openWeek(files.find(f=>f.ServerRelativeUrl===pick)||files[0], g);
+    loadHistory(g);
+  }catch(e){
+    if(g!==gen) return;
+    $('asof').innerHTML='<span class="warn">Could not read the export folder</span>';
+    showNotice(`Could not read <b>${esc(FOLDER)}</b>: ${esc(e.message)}.<br>Check that FOLDER at the top of this page points at the export folder and that you have access to it.`);
+  }
+}
+async function openWeek(f, g){
+  $('weekSel').value=f.ServerRelativeUrl;
+  const p=await getParsed(f);
+  if(g!==undefined && g!==gen) return;
+  cur=p; curSum=p.error?null:summarize(p); curIssues=p.error?[]:findIssues(p);
+  sel.alloc.clear(); sel.pull.clear(); closeDrawer();
+  $('loadPanel').classList.add('hidden');
+  paintAsOf(); paintCounters(); buildFilterOptions(); paintIssueBadge(); closeReq(); paintReqBtn();
+  if(p.error) showNotice(`This export could not be read: <b>${esc(p.error)}</b>.<br>Fix the file (or pick another week) and press Refresh.`);
+  else { $('notice').classList.add('hidden'); $('mainPanel').classList.remove('hidden'); }
+  paint();
+}
+async function loadHistory(g){
+  const list=files.slice(0,HISTORY_FILES), out=[]; let i=0;
+  const worker=async()=>{ while(i<list.length){ const f=list[i++]; out.push(await getParsed(f)); } };
+  await Promise.all([worker(),worker(),worker()]);
+  if(g!==gen) return;
+  hist=out.filter(p=>!p.error).map(p=>({p, s:summarize(p)})).sort((a,b)=>a.p.asOf-b.p.asOf);
+  histBad=out.filter(p=>p.error);
+  if(state.tab==='trends') paintTrends();
+  if(drawerKey) paintDrawer();
+}
+
+/* ───────────────────── chrome ───────────────────── */
+const STATUS={
+  gap:{l:'Sells out before restock', s:'Sells out first'},
+  alloc:{l:'Allocate', s:'Allocate'},
+  covered:{l:'Covered', s:'Covered'},
+  over:{l:'Overstock', s:'Overstock'},
+  nosales:{l:'No sales', s:'No sales'}
+};
+const HUE={gap:'#c2415f', alloc:'#e0a92e', covered:'#36a37a', over:'#2f9bd6', nosales:'#8b95a3'};
+const pill = k => `<span class="pill ${k}">${STATUS[k].s}</span>`;
+function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function toast(msg){ const t=$('toast'); t.textContent=msg; t.classList.add('show'); clearTimeout(t._h); t._h=setTimeout(()=>t.classList.remove('show'),2600); }
+function loaderHTML(msg){
+  return `<div class="loader"><svg viewBox="0 0 140 90" aria-hidden="true">
+    <g class="it i1"><rect x="48" y="8" width="10" height="20" rx="2" fill="#2f9bd6"/><rect x="49.5" y="1" width="7" height="9" rx="3.5" fill="#c2415f"/></g>
+    <g class="it i2"><circle cx="71" cy="16" r="9" fill="#f2734a"/><circle cx="71" cy="16" r="5" fill="#fff" opacity=".45"/></g>
+    <g class="it i3"><rect x="86" y="6" width="7" height="22" rx="3" fill="#36a37a"/><rect x="87" y="2" width="5" height="6" rx="1.5" fill="#16202c" opacity=".55"/></g>
+    <path d="M34 46 L44 38 H96 L106 46Z" fill="#d7b683"/>
+    <rect x="34" y="46" width="72" height="38" rx="3" fill="#e9d1a6" stroke="#b8925e" stroke-width="1.2"/>
+    <path d="M34 46 L20 38 M106 46 L120 38" stroke="#b8925e" stroke-width="3" stroke-linecap="round"/>
+    <rect x="58" y="58" width="24" height="11" rx="2" fill="#fff" opacity=".7"/>
+  </svg><div>${esc(msg)}</div></div>`;
+}
+function setLoading(msg){ $('loadPanel').innerHTML=loaderHTML(msg); $('loadPanel').classList.remove('hidden'); $('mainPanel').classList.add('hidden'); $('notice').classList.add('hidden'); }
+function showNotice(html){ $('loadPanel').classList.add('hidden'); $('mainPanel').classList.add('hidden'); $('notice').innerHTML=`<div class="empty">${html}</div>`; $('notice').classList.remove('hidden'); $('counters').innerHTML=''; }
+
+function fillWeeks(){
+  $('weekSel').innerHTML=files.map((f,i)=>`<option value="${esc(f.ServerRelativeUrl)}">${esc(prettyName(f.Name))}${i===0?' (latest)':''}</option>`).join('');
+  $('weekSel').classList.toggle('hidden', files.length<2);
+}
+function paintAsOf(){
+  const latest=files[0], isLatest=cur.file.ServerRelativeUrl===latest.ServerRelativeUrl;
+  let h=`Export for <b>${fmtD(cur.asOf)}</b> · sales ${esc(prettyName(cur.file.Name))}`;
+  if(cur.error) h+=' · <span class="warn">file could not be read</span>';
+  else if(!isLatest) h+=' · <span class="warn">earlier week</span> <button class="btn link" id="toLatest">Back to latest</button>';
+  else { const age=Math.round((nyDay(Date.now())-(latest.TimeCreated?nyDay(latest.TimeCreated):cur.asOf))/DAY);
+    if(age>STALE_DAYS) h+=` · <span class="warn">no new export in ${age} days</span>`; }
+  $('asof').innerHTML=h;
+  const b=$('toLatest'); if(b) b.onclick=()=>openWeek(files[0]);
+}
+function paintCounters(){
+  const el=$('counters'); if(!curSum){ el.innerHTML=''; return; }
+  const s=curSum;
+  el.innerHTML=Object.keys(CHIP).map(k=>`<div class="counter${state.chips.has(k)?' on':''}" data-k="${k}" tabindex="0" role="button" aria-pressed="${state.chips.has(k)}" title="Show only these — click again to clear"><div class="n">${cur.rows.filter(CHIP[k]).length}</div><div class="l">${STATUS[k].l}</div></div>`).join('');
+  el.querySelectorAll('.counter').forEach(c=>{
+    const go=()=>{ const k=c.dataset.k; state.chips.has(k)?state.chips.delete(k):state.chips.add(k);
+      if(!['alloc','cover'].includes(state.tab)) setTab('cover'); paintCounters(); paint(); };
+    c.onclick=go; c.onkeydown=e=>{ if(e.key==='Enter'||e.key===' '){ e.preventDefault(); go(); } };
+  });
+}
+function buildFilterOptions(){
+  if(!cur||cur.error) return;
+  const fill=(id,vals)=>{ const s=$(id), v=s.value; s.innerHTML='<option value="">All</option>'+vals.map(x=>`<option>${esc(x)}</option>`).join(''); s.value=vals.includes(v)?v:''; };
+  fill('fFam',[...new Set(cur.rows.map(r=>r.product))].sort());
+  const vends=[...new Set(cur.rows.map(r=>r.vendor).filter(Boolean))].sort();
+  fill('fVend',vends); $('fVendWrap').classList.toggle('hidden', vends.length<2);
+  state.fam=$('fFam').value; state.vend=$('fVend').value;
+}
+function paintIssueBadge(){ const n=curIssues.reduce((s,c)=>s+c.items.length,0), b=$('issueBadge'); b.textContent=n; b.classList.toggle('hidden',!n); }
+
+function setTab(t){
+  state.tab=t;
+  document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x.dataset.tab===t));
+}
+function paint(){
+  if(!cur||cur.error) return;
+  const t=state.tab;
+  ['alloc','cover','pull','trends','issues'].forEach(x=>$(x+'View').classList.toggle('hidden',x!==t));
+  $('filterBar').classList.toggle('hidden', !['alloc','cover','pull'].includes(t));
+  $('xlsxBtn').classList.toggle('hidden', !sel[t]);
+  if(t==='alloc'||t==='pull') paintTable(t);
+  else if(t==='cover') paintCover();
+  else if(t==='trends') paintTrends();
+  else paintIssues();
+  updateExportBtn();
+}
+const CHIP={ gap:r=>r.status==='gap', alloc:r=>r.alloc>0 };   // Allocate includes Sells out before restock
+function baseRows(t){
+  const q=state.q.trim().toLowerCase();
+  const r=cur.rows.filter(x=>(!q||x.hay.includes(q))&&(!state.fam||x.product===state.fam)&&(!state.vend||x.vendor===state.vend));
+  if(t==='pull') return r.filter(pullable);
+  return state.chips.size ? r.filter(x=>[...state.chips].some(k=>CHIP[k](x))) : r;
+}
+
+/* ───────────────────── tables ───────────────────── */
+function deadlineCell(r){
+  if(r.deadline==null) return '<span class="dim">–</span>';
+  const d=Math.round((r.deadline-cur.asOf)/DAY);
+  return `${fmtD(r.deadline)} <span class="${d<=0?'warn':'dim'}">${d<=0?'today':'in '+d+' d'}</span>`;
+}
+const SPEC={
+  alloc:[
+    {k:'status', t:'Status', fit:1, html:r=>pill(r.status), sv:r=>RANK[r.status]*1e6+(r.soIn==null?99999:r.soIn)},
+    {k:'sku', t:'SKU', fit:1},
+    {k:'product', t:'Description', fit:1},
+    {k:'variant', t:'Variant', fit:1},
+    {k:'deadline', t:'Reorder by', d:1, html:deadlineCell},
+    {k:'soDate', t:'Sells out', d:1, html:r=>r.soDate==null?'<span class="dim">–</span>':r.soEst?`<span class="est" title="Estimated from cover">${fmtD(r.soDate)}</span>`:fmtD(r.soDate)},
+    {k:'cover', t:'Cover', n:1, f:fmtCover, tip:'(On hand + incoming) ÷ avg daily sales'},
+    {k:'ads', t:'Avg / day', n:1, f:fmt2},
+    {k:'onhand', t:'On hand', n:1, f:fmtN},
+    {k:'alloc', t:'Allocate', n:1, cls:'strong', tip:`Shopify quantity rounded up to full cases of ${CASE_PACK}`,
+      html:r=>r.alloc?`<span title="Shopify ${fmtN(r.shopAlloc)} · ${r.cases} case${r.cases===1?'':'s'} of ${r.cp}">${fmtN(r.alloc)}</span>`:'0'}
+  ],
+  pull:[
+    {k:'status', t:'Status', fit:1, html:r=>pill(r.status), sv:r=>RANK[r.status]},
+    {k:'sku', t:'SKU', fit:1},
+    {k:'product', t:'Description', fit:1},
+    {k:'variant', t:'Variant', fit:1},
+    {k:'cover', t:'Cover', n:1, f:fmtCover, sv:r=>r.cover==null?1e9:r.cover, tip:'No sales = no cover figure; sorts first'},
+    {k:'ads', t:'Avg / day', n:1, f:fmt2},
+    {k:'onhand', t:'On hand', n:1, f:fmtN}
+  ]
+};
+const DEFSORT={alloc:{k:'status',d:1}, pull:{k:'cover',d:-1}};
+const EMPTY={alloc:'No SKUs match these filters.', pull:'Nothing to pull back — every SKU is within lead time + days to keep.'};
+function sortRows(rows, sv, d){
+  return rows.sort((a,b)=>{ const x=sv(a), y=sv(b), nx=x==null||x==='', ny=y==null||y==='';
+    if(nx||ny) return nx===ny?0:nx?1:-1;
+    return (typeof x==='number'&&typeof y==='number' ? x-y : String(x).localeCompare(String(y),undefined,{numeric:true}))*d; });
+}
+function paintTable(t){
+  const cols=SPEC[t], s=state.sort[t]||DEFSORT[t], col=cols.find(c=>c.k===s.k)||cols[0];
+  const rows=sortRows(baseRows(t), col.sv||(r=>r[col.k]), s.d);
+  const tb=$(t+'Tbl'), all=rows.length>0&&rows.every(r=>sel[t].has(r.key));
+  tb.tHead.innerHTML=`<tr><th class="cb"><input type="checkbox" data-all ${all?'checked':''} title="Tick all shown" aria-label="Tick all shown"></th>`+
+    cols.map(c=>`<th data-k="${c.k}" class="${c.n||c.d?'r':''}${c.fit?' fit':''}"${c.tip?` title="${esc(c.tip)}"`:''}>${esc(c.t)}${c.k===s.k?`<span class="arrow">${s.d>0?'▲':'▼'}</span>`:''}</th>`).join('')+'</tr>';
+  tb.tBodies[0].innerHTML=rows.length ? rows.map(r=>`<tr class="row st-${r.status}${r.key===drawerKey?' cur':''}" data-k="${esc(r.key)}"><td class="cb"><input type="checkbox" ${sel[t].has(r.key)?'checked':''} aria-label="Tick ${esc(r.sku)}"></td>`+
+    cols.map(c=>`<td class="${c.n||c.d?'num':''} ${c.cls||''}${c.fit?' fit':''}">${c.html?c.html(r):esc(c.f?c.f(r[c.k]):r[c.k])}</td>`).join('')+'</tr>').join('')
+    : `<tr><td colspan="${cols.length+1}" class="empty">${EMPTY[t]}</td></tr>`;
+  $(t+'Count').textContent = t==='pull' ? `${rows.length} of ${cur.rows.filter(pullable).length} SKUs`
+    : `${rows.length} of ${cur.rows.length} SKUs · ${fmtN(rows.reduce((x,r)=>x+r.alloc,0))} units to allocate`;
+}
+['alloc','pull'].forEach(t=>{
+  const tb=$(t+'Tbl');
+  tb.tHead.addEventListener('click',e=>{ const th=e.target.closest('th[data-k]'); if(!th) return;
+    const s=state.sort[t]||DEFSORT[t]; state.sort[t]={k:th.dataset.k, d:s.k===th.dataset.k?-s.d:(SPEC[t].find(c=>c.k===th.dataset.k).n?-1:1)}; paintTable(t); });
+  tb.tHead.addEventListener('change',e=>{ if(!e.target.matches('[data-all]')) return;
+    baseRows(t).forEach(r=>e.target.checked?sel[t].add(r.key):sel[t].delete(r.key)); paintTable(t); updateExportBtn(); });
+  tb.tBodies[0].addEventListener('click',e=>{
+    const tr=e.target.closest('tr.row'); if(!tr) return;
+    if(e.target.closest('td.cb')){
+      const cb=tr.querySelector('input'); if(e.target!==cb) cb.checked=!cb.checked;
+      cb.checked?sel[t].add(tr.dataset.k):sel[t].delete(tr.dataset.k);
+      const rows=baseRows(t); tb.tHead.querySelector('[data-all]').checked=rows.length>0&&rows.every(r=>sel[t].has(r.key));
+      updateExportBtn(); return;
+    }
+    openDrawer(tr.dataset.k);
+  });
+});
+function updateExportBtn(){
+  paintReqBtn();
+  const s=sel[state.tab], b=$('xlsxBtn'); if(!s) return;
+  b.disabled=!s.size; b.textContent=s.size?`Export Excel (${s.size})`:'Export Excel';
+  b.title=s.size?'Export the ticked rows':'Tick rows to export';
+}
+function exportSel(){
+  const t=state.tab; if(!sel[t]||!sel[t].size) return;
+  if(typeof XLSX==='undefined'){ toast('Excel library did not load — check the network'); return; }
+  const cols=SPEC[t], s=state.sort[t]||DEFSORT[t], col=cols.find(c=>c.k===s.k)||cols[0];
+  const rows=sortRows(cur.rows.filter(r=>sel[t].has(r.key)&&(t!=='pull'||pullable(r))), col.sv||(r=>r[col.k]), s.d);
+  const val=(r,c)=>c.k==='status'?STATUS[r.status].l : c.d ? (r[c.k]==null?'':r[c.k]/DAY+25569) : c.k==='cover' ? (r.cover==null?'':Math.round(r.cover)) : c.k==='ads' ? r.ads : (r[c.k]==null?'':r[c.k]);
+  const aoa=[cols.map(c=>c.k==='cover'?'Cover (days)':c.t)].concat(rows.map(r=>cols.map(c=>val(r,c))));
+  const ws=XLSX.utils.aoa_to_sheet(aoa);
+  cols.forEach((c,C)=>{ if(!c.d&&c.k!=='cost'&&c.k!=='revenue') return;
+    for(let R=1;R<=rows.length;R++){ const cell=ws[XLSX.utils.encode_cell({r:R,c:C})]; if(cell&&cell.t==='n') cell.z=c.d?'m/d/yyyy':'$#,##0'; } });
+  ws['!cols']=cols.map(c=>({wch:c.k==='product'?38:Math.max(10,c.t.length+2)}));
+  const wb=XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, t==='pull'?'Pull back':'Allocation');
+  XLSX.writeFile(wb, `Ecom ${t==='pull'?'Pull Back':'Allocation'} ${fmtD(cur.asOf).replace(/\//g,'-')}.xlsx`);
+  toast(`Exported ${rows.length} row${rows.length===1?'':'s'}`);
+}
+
+/* ───────────────────── days-of-cover runway (main screen) ───────────────────── */
+function mode(xs){ const m=new Map(); let best=xs[0], n=0; xs.forEach(x=>{ const c=(m.get(x)||0)+1; m.set(x,c); if(c>n){n=c;best=x;} }); return best; }
+function paintCover(){
+  const box=$('coverChart');
+  const rows=sortRows(baseRows('cover'), r=>r.cover, 1);
+  if(!rows.length){ box.innerHTML='<div class="empty">No SKUs match these filters.</div>'; return; }
+  const lead=mode(rows.map(r=>r.lead)), tgt=lead+mode(rows.map(r=>r.target));
+  const MAX=Math.max(390, Math.ceil(tgt*2.5/30)*30), pc=d=>Math.min(Math.max(d,0),MAX)/MAX*100, P=d=>pc(d).toFixed(3)+'%';
+  const tickable=rows.filter(r=>r.alloc>0), all=tickable.length>0&&tickable.every(r=>sel.alloc.has(r.key));
+  let axis='';
+  for(let d=0; d<=MAX; d+=30) axis+=`<span class="tk" style="left:${P(d)}">${d===0?'Today':d/30+' mo'}</span>`;
+  axis+=`<i class="mk rs" style="left:${P(lead)}"></i><span class="mkl rs" style="left:${P(lead)}">Restock arrives · ${lead} d</span>`+
+        `<i class="mk tg" style="left:${P(tgt)}"></i><span class="mkl tg" style="left:${P(tgt)}">Target · ${tgt} d</span>`;
+  let h=`<div class="cv" style="--mo:${(30/MAX*100).toFixed(4)}%">`+
+    `<div class="ch cbx"><input type="checkbox" data-all ${all?'checked':''} ${tickable.length?'':'disabled'} title="Tick every style that needs allocation" aria-label="Tick every style that needs allocation"></div>`+
+    `<div class="ch">SKU</div><div class="ch">Description</div><div class="ch">Variant</div><div class="ch axis"><div class="ti">${axis}</div></div>`;
+  const marks=`<i class="mk rs" style="left:${P(lead)}"></i><i class="mk tg" style="left:${P(tgt)}"></i>`;
+  rows.forEach(r=>{
+    let run='';
+    if(r.cover==null) run=`<span class="cvl" style="left:0">No sales in window · ${fmtN(r.onhand+r.incoming)} units on hand</span>`;
+    else{
+      const cov=r.cover; let end=pc(cov), lbl=fmtCover(cov), off='6px';
+      if(r.alloc>0&&r.ads>0){
+        const st=Math.max(cov,r.lead), en=st+r.alloc/r.ads;
+        if(cov<r.lead) run+=`<b class="hat" style="left:${P(cov)};width:${(pc(r.lead)-pc(cov)).toFixed(3)}%"></b>`;
+        run+=`<b class="gh" style="left:${P(st)};width:${Math.max(.4,pc(en)-pc(st)).toFixed(3)}%"></b>`;
+        end=pc(en); lbl+=' → '+fmtCover(en);
+      }
+      run+=`<b class="bar" style="left:0;width:${P(cov)}"></b>`;
+      if(cov>MAX){ run+='<b class="arw"></b>'; off='14px'; }
+      run+=`<span class="cvl" style="left:calc(${end.toFixed(3)}% + ${off})">${lbl}</span>`;
+    }
+    const full=r.sku+' — '+r.product+(r.variant?' — '+r.variant:'');
+    h+=`<div class="cr s-${r.status}${r.key===drawerKey?' cur':''}" data-k="${esc(r.key)}" title="${esc(full)}\n${esc(STATUS[r.status].l)}${r.alloc?' · allocate '+fmtN(r.alloc)+' ('+r.cases+' cs)':''}">`+
+      `<div class="cc cbx">${r.alloc>0?`<input type="checkbox" data-k="${esc(r.key)}" ${sel.alloc.has(r.key)?'checked':''} aria-label="Tick ${esc(r.sku)}">`:''}</div>`+
+      `<div class="cc sku" tabindex="0">${esc(r.sku)}</div><div class="cc ds">${esc(r.product)}</div><div class="cc vr">${esc(r.variant)}</div>`+
+      `<div class="cc track"><div class="ti">${marks}${run}</div></div></div>`;
+  });
+  box.innerHTML=h+'</div>';
+}
+$('coverChart').addEventListener('change',e=>{
+  const t=e.target;
+  if(t.matches('[data-all]')){ baseRows('cover').filter(r=>r.alloc>0).forEach(r=>t.checked?sel.alloc.add(r.key):sel.alloc.delete(r.key)); paintCover(); }
+  else if(t.dataset.k){ t.checked?sel.alloc.add(t.dataset.k):sel.alloc.delete(t.dataset.k);
+    const tk=baseRows('cover').filter(r=>r.alloc>0), a=$('coverChart').querySelector('[data-all]'); if(a) a.checked=tk.length>0&&tk.every(r=>sel.alloc.has(r.key)); }
+  paintReqBtn();
+});
+$('coverChart').addEventListener('click',e=>{ if(e.target.closest('.cbx')) return; const c=e.target.closest('.cr[data-k]'); if(c) openDrawer(c.dataset.k); });
+$('coverChart').addEventListener('keydown',e=>{ const c=e.target.closest('.cr[data-k]'); if(c&&e.target.classList.contains('sku')&&(e.key==='Enter'||e.key===' ')){ e.preventDefault(); openDrawer(c.dataset.k); } });
+
+/* ───────────────────── trends ───────────────────── */
+function paintTrends(){
+  const b=$('trendsBody');
+  if(!hist){ b.innerHTML=loaderHTML('Reading earlier exports…'); return; }
+  let h=histBad.length?`<div class="meta"><span class="warn">${histBad.length} file${histBad.length===1?'':'s'} could not be read:</span> ${histBad.map(p=>esc(p.file.Name)+' — '+esc(p.error)).join('; ')}</div>`:'';
+  if(hist.length<2){ b.innerHTML=h+`<div class="empty">Trends start once two weekly exports are in the folder — there ${hist.length===1?'is 1':'are '+hist.length} so far.</div>`; return; }
+  const W=Math.max(b.clientWidth||900,520), H=210, L=16, R=16, T=26, B=40, n=hist.length, bw=(W-L-R)/n;
+  const maxU=Math.max(1,...hist.map(x=>x.s.units));
+  let s=`<svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" role="img" aria-label="Units to allocate by week">`;
+  hist.forEach((x,i)=>{
+    const hh=(H-T-B)*x.s.units/maxU, bx=L+i*bw+bw*.18, by=H-B-hh, curW=x.p.file.ServerRelativeUrl===cur.file.ServerRelativeUrl;
+    s+=`<rect x="${bx}" y="${by}" width="${bw*.64}" height="${Math.max(1,hh)}" rx="5" fill="${curW?'#1b6fae':'#2f9bd6'}" fill-opacity="${curW?1:.45}"><title>${esc(fmtD(x.p.asOf))}: ${fmtN(x.s.units)} units · ${x.s.counts.gap} sell out before restock</title></rect>`;
+    s+=`<text x="${bx+bw*.32}" y="${by-6}" text-anchor="middle" class="bv">${fmtN(x.s.units)}</text>`;
+    if(x.s.counts.gap) s+=`<text x="${bx+bw*.32}" y="${H-B+30}" text-anchor="middle" class="mkl rs">${x.s.counts.gap} short</text>`;
+    s+=`<text x="${bx+bw*.32}" y="${H-B+15}" text-anchor="middle" class="bw">${fmtD(x.p.asOf)}</text>`;
+  });
+  s+='</svg>';
+  h+=`<div class="runhdr">Units to allocate by week <span class="h">Red count = SKUs that sell out before restock that week</span></div><div class="chartwrap" style="max-height:none;padding:8px 6px 2px">${s}</div>`;
+  h+=`<div class="runhdr">Week by week <span class="h">Click a week to open it</span></div><div class="tw" style="max-height:none"><table><thead><tr>
+    <th>Week of</th><th>Sales window</th><th class="r">SKUs</th><th class="r">To allocate</th><th class="r">Sells out before restock</th><th class="r">Overstock</th><th class="r">Units sold</th><th class="r">Revenue</th></tr></thead><tbody>`+
+    hist.slice().reverse().map(x=>`<tr class="row${x.p.file.ServerRelativeUrl===cur.file.ServerRelativeUrl?' cur':''}" data-f="${esc(x.p.file.ServerRelativeUrl)}">
+      <td>${fmtD(x.p.asOf)}</td><td>${esc(prettyName(x.p.file.Name))}</td><td class="num">${x.s.skus}</td><td class="num">${fmtN(x.s.units)}</td>
+      <td class="num">${x.s.counts.gap}</td><td class="num">${x.s.counts.over}</td><td class="num">${fmtN(x.s.sold)}</td><td class="num">${fmt$(x.s.revenue)}</td></tr>`).join('')+'</tbody></table></div>';
+  b.innerHTML=h;
+}
+$('trendsBody').addEventListener('click',e=>{ const tr=e.target.closest('tr[data-f]'); if(!tr) return;
+  const f=files.find(x=>x.ServerRelativeUrl===tr.dataset.f); if(f){ setTab('cover'); openWeek(f); } });
+
+/* ───────────────────── data issues ───────────────────── */
+function paintIssues(){
+  const b=$('issuesBody');
+  if(!curIssues.length){ b.innerHTML='<div class="empty">No data issues in this export.</div>'; return; }
+  b.innerHTML=curIssues.map(c=>`<div class="runhdr">${esc(c.cat)} <span class="ct bad">${c.items.length}</span>${c.hint?`<span class="h">${esc(c.hint)}</span>`:''}</div>
+    <div class="tw" style="max-height:none"><table><tbody>${c.items.map(it=>it.rows
+      ? `<tr class="row" data-k="${esc(it.rows[0].key)}"><td>${esc(it.rows.map(r=>r.sku||'(no SKU)').join(', '))}</td><td class="wrap">${esc(it.rows[0].product)}</td><td>${esc([...new Set(it.rows.map(r=>r.variant).filter(Boolean))].join(', '))}</td><td class="dim">${esc(it.text)}</td></tr>`
+      : `<tr><td colspan="4">${esc(it.text)}</td></tr>`).join('')}</tbody></table></div>`).join('');
+}
+$('issuesBody').addEventListener('click',e=>{ const tr=e.target.closest('tr[data-k]'); if(tr) openDrawer(tr.dataset.k); });
+
+/* ───────────────────── drawer ───────────────────── */
+function openDrawer(k){ closeReq(); drawerKey=k; paintDrawer(); $('drawer').classList.add('open'); $('drawer').setAttribute('aria-hidden','false');
+  document.querySelectorAll('tr.row[data-k],.cr[data-k]').forEach(tr=>tr.classList.toggle('cur',tr.dataset.k===k)); }
+function closeDrawer(){ drawerKey=null; $('drawer').classList.remove('open'); $('drawer').setAttribute('aria-hidden','true');
+  document.querySelectorAll('tr.row.cur[data-k],.cr.cur[data-k]').forEach(tr=>tr.classList.remove('cur')); }
+function paintDrawer(){
+  const r=cur&&cur.rows.find(x=>x.key===drawerKey); if(!r){ closeDrawer(); return; }
+  const kv=pairs=>pairs.filter(p=>p[1]!==''&&p[1]!=null).map(([k,v])=>`<div class="k">${k}</div><div class="v">${v}</div>`).join('');
+  $('dTitle').textContent=(r.sku?r.sku+' — ':'')+r.product;
+  $('dSub').innerHTML=`${r.variant?esc(r.variant)+' · ':''}${r.vendor?esc(r.vendor)+' ':''}${pill(r.status)}`;
+  $('dWeek').innerHTML=kv([
+    ['Allocate', r.alloc?`<b>${fmtN(r.alloc)}</b> units · ${r.cases} case${r.cases===1?'':'s'} <span class="dim">(Shopify ${fmtN(r.shopAlloc)})</span>`:'0'],
+    ['Restock arrives', fmtD(r.arrives)],
+    ['Reorder by', r.deadline!=null?deadlineCell(r):''],
+    ['Stock lasts till', fmtD(r.lasts)]
+  ]);
+  $('dStock').innerHTML=kv([
+    ['On hand', fmtN(r.onhand)], ['Incoming', fmtN(r.incoming)], ['Avg daily sales', fmt2(r.ads)],
+    ['Units sold', fmtN(r.sold)], ['Revenue', fmt$(r.revenue)], ['Cover', fmtCover(r.cover)],
+    ['Sells out', r.soDate!=null?fmtD(r.soDate)+(r.soEst?' <span class="est">(estimated)</span>':''):''],
+    ['Lead time', r.lead+' d'], ['Days to keep', r.target+' d']
+  ]);
+  if(!hist){ $('dHist').innerHTML='<div class="dim" style="font-size:12px">Reading earlier exports…</div>'; return; }
+  const wk=hist.map(x=>({p:x.p, r:x.p.rows.find(y=>y.key===r.key)})).filter(x=>x.r).reverse();
+  $('dHist').innerHTML=wk.length<2 ? '<div class="dim" style="font-size:12px">History builds as weekly exports arrive.</div>'
+    : `<div class="tw" style="max-height:none"><table><thead><tr><th>Week of</th><th class="r">Allocate</th><th class="r">On hand</th><th class="r">Avg / day</th><th class="r">Cover</th><th>Status</th></tr></thead><tbody>`+
+      wk.map(x=>`<tr><td>${fmtD(x.p.asOf)}</td><td class="num">${fmtN(x.r.alloc)}</td><td class="num">${fmtN(x.r.onhand)}</td><td class="num">${fmt2(x.r.ads)}</td><td class="num">${fmtCover(x.r.cover)}</td><td>${pill(x.r.status)}</td></tr>`).join('')+'</tbody></table></div>';
+}
+$('dClose').onclick=closeDrawer;
+document.addEventListener('keydown',e=>{ if(e.key!=='Escape') return; if(drawerKey) closeDrawer(); if($('reqDrawer').classList.contains('open')) closeReq(); });
+
+/* ───────────────────── replenishment request ───────────────────── */
+const isLatest=()=>!!(cur&&files[0]&&cur.file.ServerRelativeUrl===files[0].ServerRelativeUrl);
+const sentKey=()=>'ea_req|'+(cur?cur.file.ServerRelativeUrl:'');
+function lsGet(k){ try{ return JSON.parse(localStorage.getItem(k)||'null'); }catch(e){ return null; } }
+function lsSet(k,v){ try{ localStorage.setItem(k,JSON.stringify(v)); }catch(e){} }
+const fmtWhen=t=>new Date(t).toLocaleString('en-US',{timeZone:'America/New_York',month:'numeric',day:'numeric',hour:'numeric',minute:'2-digit'});
+function reqRows(){
+  return cur.rows.filter(r=>r.alloc>0&&sel.alloc.has(r.key)).map(r=>({r, cp:r.cp, cases:r.cases, qty:r.alloc}))
+    .sort((a,b)=>RANK[a.r.status]-RANK[b.r.status] || (a.r.deadline??9e15)-(b.r.deadline??9e15) || String(a.r.sku).localeCompare(String(b.r.sku),undefined,{numeric:true}));
+}
+function paintReqBtn(){
+  const b=$('reqBtn');
+  if(!cur||cur.error||!cur.rows.some(r=>r.alloc>0)){ b.classList.add('hidden'); return; }
+  const n=cur.rows.filter(r=>r.alloc>0&&sel.alloc.has(r.key)).length, sent=lsGet(sentKey());
+  b.classList.remove('hidden'); b.disabled=!isLatest()||!n;
+  b.textContent=n?`Replenish (${n})`:'Replenish';
+  b.title=!isLatest()?'Switch to the latest week to send a request':!n?'Tick the styles to replenish':'Review and email the replenishment request'+(sent?` — last sent ${fmtWhen(sent.at)}`:'');
+}
+function openReq(){
+  if(!isLatest()) return;
+  closeDrawer();
+  const rows=reqRows(); if(!rows.length) return;
+  const need=rows.reduce((s,x)=>s+x.r.shopAlloc,0), units=rows.reduce((s,x)=>s+x.qty,0), cases=rows.reduce((s,x)=>s+x.cases,0);
+  $('rSub').innerHTML=`Ticked styles · week of <b>${fmtD(cur.asOf)}</b> · ${rows.length} style${rows.length===1?'':'s'} · <b>${fmtN(cases)}</b> cases · <b>${fmtN(units)}</b> units`;
+  if(!$('rTo').value) $('rTo').value=lsGet('ea_req_to')||REQUEST_TO;
+  $('rTbl').tHead.innerHTML='<tr><th>SKU</th><th>Description</th><th>Variant</th><th class="r" title="Allocate from the export">Needed</th><th class="r">Cases</th><th class="r">Send</th></tr>';
+  $('rTbl').tBodies[0].innerHTML=rows.map(x=>`<tr class="st-${x.r.status}"${x.r.status==='gap'?` title="Sells out ${fmtD(x.r.soDate)} — before restock"`:''}><td>${esc(x.r.sku)}</td><td class="wrap">${esc(x.r.product)}</td><td>${esc(x.r.variant)}</td><td class="num dim">${fmtN(x.r.shopAlloc)}</td><td class="num">${x.cases}</td><td class="num strong">${fmtN(x.qty)}</td></tr>`).join('');
+  $('rFoot').textContent=`Rounded up to full ${CASE_PACK}-piece cases: ${fmtN(units)} units vs ${fmtN(need)} in the export (+${fmtN(units-need)}). Urgent styles are listed first. A spreadsheet of this list is attached.`;
+  const sent=lsGet(sentKey());
+  $('rState').innerHTML=sent?`Sent ${esc(fmtWhen(sent.at))} to ${esc(sent.to)}`:'';
+  $('rSend').textContent=sent?'Send again':'Send request';
+  $('reqDrawer').classList.add('open'); $('reqDrawer').setAttribute('aria-hidden','false');
+}
+function closeReq(){ $('reqDrawer').classList.remove('open'); $('reqDrawer').setAttribute('aria-hidden','true'); }
+function buildMail(rows, note, name){
+  const units=rows.reduce((s,x)=>s+x.qty,0), cases=rows.reduce((s,x)=>s+x.cases,0);
+  const td='padding:6px 10px;border-bottom:1px solid #e3e8ef;', th=td+'background:#f0f5fb;font-weight:600;text-align:left;', R_='text-align:right;';
+  const body=rows.map(x=>`<tr><td style="${td}">${esc(x.r.sku)}</td><td style="${td}">${esc(x.r.product)}</td><td style="${td}">${esc(x.r.variant)}</td><td style="${td+R_}">${x.cases}</td><td style="${td+R_}font-weight:700">${fmtN(x.qty)}</td><td style="${td}color:#c2415f">${x.r.status==='gap'?'Urgent — sells out '+fmtD(x.r.soDate):''}</td></tr>`).join('');
+  const html=`<div style="font-family:Segoe UI,Arial,sans-serif;font-size:14px;color:#16202c">
+<p>Please send the styles below to ecom. Quantities are rounded up to full ${CASE_PACK}-piece cases.</p>
+${note?`<p>${esc(note).replace(/\n/g,'<br>')}</p>`:''}
+<table style="border-collapse:collapse;font-size:13px"><tr><th style="${th}">SKU</th><th style="${th}">Description</th><th style="${th}">Variant</th><th style="${th+R_}">Cases</th><th style="${th+R_}">Units</th><th style="${th}"></th></tr>${body}
+<tr><td style="${td}font-weight:700" colspan="3">Total · ${rows.length} styles</td><td style="${td+R_}font-weight:700">${fmtN(cases)}</td><td style="${td+R_}font-weight:700">${fmtN(units)}</td><td style="${td}"></td></tr></table>
+<p>Thanks<br>${esc(name)}</p>
+<p style="color:#5f6c7d;font-size:12px">From M1S · Ecom Allocation — Shopify export for ${fmtD(cur.asOf)}, sales ${esc(prettyName(cur.file.Name))}. Spreadsheet attached.</p></div>`;
+  return { subject:`Ecom replenishment request · week of ${fmtD(cur.asOf)} · ${rows.length} styles, ${fmtN(units)} units`, html };
+}
+function buildAttachment(rows){
+  if(typeof XLSX==='undefined') return null;
+  const aoa=[['Check','SKU','Description','Variant','Cases','Units','Case pack','Needed (Shopify)','Sells out','Urgent','Notes']]
+    .concat(rows.map(x=>['☐',x.r.sku,x.r.product,x.r.variant,x.cases,x.qty,x.cp,x.r.shopAlloc,x.r.soDate==null?'':x.r.soDate/DAY+25569,x.r.status==='gap'?'Yes':'','']));
+  const ws=XLSX.utils.aoa_to_sheet(aoa);
+  for(let R=1;R<=rows.length;R++){ const c=ws[XLSX.utils.encode_cell({r:R,c:8})]; if(c&&c.t==='n') c.z='m/d/yyyy'; }
+  ws['!cols']=[{wch:7},{wch:11},{wch:38},{wch:16},{wch:7},{wch:8},{wch:10},{wch:16},{wch:11},{wch:8},{wch:30}];
+  const wb=XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, 'Replenishment');
+  return {'@odata.type':'#microsoft.graph.fileAttachment', name:`Ecom Replenishment ${fmtD(cur.asOf).replace(/\//g,'-')}.xlsx`,
+    contentType:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', contentBytes:XLSX.write(wb,{type:'base64',bookType:'xlsx'})};
+}
+async function mailToken(){
+  try{ return (await msalApp.acquireTokenSilent({scopes:MAIL_SCOPES, account})).accessToken; }
+  catch(e){ return (await msalApp.acquireTokenPopup({scopes:MAIL_SCOPES, account})).accessToken; }
+}
+async function sendReq(){
+  const to=$('rTo').value.split(/[;,\s]+/).map(s=>s.trim()).filter(Boolean);
+  if(!to.length){ $('rState').innerHTML='<span class="warn">Add at least one recipient.</span>'; $('rTo').focus(); return; }
+  const bad=to.filter(a=>!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(a));
+  if(bad.length){ $('rState').innerHTML='<span class="warn">Check this address: '+esc(bad.join(', '))+'</span>'; $('rTo').focus(); return; }
+  if(!reqRows().length){ $('rState').innerHTML='<span class="warn">Tick at least one style to replenish.</span>'; return; }
+  const btn=$('rSend'); btn.disabled=true; btn.textContent='Sending…'; $('rState').textContent='';
+  try{
+    const rows=reqRows(), name=(account.idTokenClaims&&account.idTokenClaims.name)||account.username;
+    const {subject, html}=buildMail(rows, $('rNote').value.trim(), name), att=buildAttachment(rows);
+    const tok=await mailToken();
+    const r=await fetch('https://graph.microsoft.com/v1.0/me/sendMail',{method:'POST',
+      headers:{'Authorization':'Bearer '+tok,'Content-Type':'application/json'},
+      body:JSON.stringify({message:{subject, body:{contentType:'HTML',content:html}, toRecipients:to.map(a=>({emailAddress:{address:a}})), attachments:att?[att]:[]}, saveToSentItems:true})});
+    if(r.status!==202){ let m=''; try{ const j=await r.json(); m=j.error&&j.error.message; }catch(e){} throw new Error(r.status+(m?' '+m:'')); }
+    const rec={at:Date.now(), to:to.join('; ')};
+    lsSet(sentKey(), rec); lsSet('ea_req_to', rec.to);
+    $('rState').innerHTML=`Sent ${esc(fmtWhen(rec.at))} to ${esc(rec.to)}`;
+    toast('Replenishment request sent'); paintReqBtn();
+    btn.textContent='Send again';
+  }catch(e){
+    const msg=e.errorCode==='popup_window_error'?'The sign-in window was blocked — allow pop-ups for this page and press Send again':(e.errorMessage||e.message||String(e));
+    $('rState').innerHTML='<span class="warn">Not sent: '+esc(msg)+'</span>';
+    btn.textContent=lsGet(sentKey())?'Send again':'Send request';
+  }finally{ btn.disabled=false; }
+}
+
+/* ───────────────────── wiring ───────────────────── */
+document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{ setTab(t.dataset.tab); paint(); });
+$('q').oninput=()=>{ state.q=$('q').value; paint(); };
+$('fFam').onchange=()=>{ state.fam=$('fFam').value; paint(); };
+$('fVend').onchange=()=>{ state.vend=$('fVend').value; paint(); };
+$('clearF').onclick=()=>{ state.q=''; state.fam=''; state.vend=''; state.chips.clear(); $('q').value=''; $('fFam').value=''; $('fVend').value=''; paintCounters(); paint(); };
+$('xlsxBtn').onclick=exportSel;
+$('reqBtn').onclick=openReq; $('rClose').onclick=closeReq; $('rSend').onclick=sendReq;
+$('weekSel').onchange=()=>{ const f=files.find(x=>x.ServerRelativeUrl===$('weekSel').value); if(f) openWeek(f); };
+$('refreshBtn').onclick=()=>loadAll(cur&&cur.file.ServerRelativeUrl!==(files[0]&&files[0].ServerRelativeUrl)?cur.file.ServerRelativeUrl:null);
+let rzT; addEventListener('resize',()=>{ clearTimeout(rzT); rzT=setTimeout(()=>{ if(!cur||cur.error) return; if(state.tab==='cover') paintCover(); if(state.tab==='trends') paintTrends(); },150); });
+
+initAuth();
+</script>
+</body>
+</html>
